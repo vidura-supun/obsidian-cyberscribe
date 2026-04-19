@@ -1,5 +1,6 @@
 import {
   App,
+  Editor,
   MarkdownPostProcessorContext,
   Plugin,
   PluginSettingTab,
@@ -30,6 +31,8 @@ interface DefangRule {
 
 interface PluginSettings {
   colorRules: ColorRule[];
+  plainTextPaste: boolean;
+  dateTokens: boolean;
   defang: {
     ips: DefangRule;
     domains: DefangRule;
@@ -58,6 +61,8 @@ const FLAT_COLORS = [
 
 const DEFAULT_SETTINGS: PluginSettings = {
   colorRules: [],
+  plainTextPaste: false,
+  dateTokens: true,
   defang: {
     ips: {
       regex: String.raw`\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b`,
@@ -139,9 +144,26 @@ function isDefanged(text: string): boolean {
   return text.includes('[.]') || text.includes('[@]');
 }
 
-// ─── CM6 defang annotation (prevents re-processing our own transactions) ──────
+// ─── CM6 transaction annotations (prevent re-processing our own transactions) ─
 
 const defangTx = Annotation.define<true>();
+const dateTx   = Annotation.define<true>();
+
+// ─── Date token helpers ───────────────────────────────────────────────────────
+
+function utcDateString(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())}`;
+}
+
+function utcDateTimeString(): string {
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const date = `${now.getUTCFullYear()}-${pad(now.getUTCMonth() + 1)}-${pad(now.getUTCDate())}`;
+  const time = `${pad(now.getUTCHours())}:${pad(now.getUTCMinutes())}:${pad(now.getUTCSeconds())}`;
+  return `${date} ${time} UTC`;
+}
 
 // ─── Main Plugin ──────────────────────────────────────────────────────────────
 
@@ -153,6 +175,50 @@ export default class IOCHighlighter extends Plugin {
     this.addSettingTab(new SettingsTab(this.app, this));
     this.registerEditorExtension(this.buildEditorExtensions());
     this.registerMarkdownPostProcessor(this.processReadingView.bind(this));
+
+    this.addCommand({
+      id: 'process-date-tokens',
+      name: 'Process date tokens in note',
+      editorCallback: (editor: Editor) => {
+        const tokens: { pattern: RegExp; value: () => string }[] = [
+          { pattern: /<\$ datetime-now \$>/g, value: utcDateTimeString },
+          { pattern: /<\$ date-now \$>/g,     value: utcDateString },
+        ];
+        let content = editor.getValue();
+        let changed = false;
+        for (const { pattern, value } of tokens) {
+          const replaced = content.replace(pattern, () => { changed = true; return value(); });
+          content = replaced;
+        }
+        if (changed) editor.setValue(content);
+      },
+    });
+
+    this.addCommand({
+      id: 'insert-date',
+      name: 'Insert current date (YYYY-MM-DD)',
+      editorCallback: (editor: Editor) => {
+        editor.replaceSelection(utcDateString());
+      },
+    });
+
+    this.addCommand({
+      id: 'insert-datetime',
+      name: 'Insert current datetime (YYYY-MM-DD HH:mm:ss UTC)',
+      editorCallback: (editor: Editor) => {
+        editor.replaceSelection(utcDateTimeString());
+      },
+    });
+
+    this.registerEvent(
+      this.app.workspace.on('editor-paste', (evt: ClipboardEvent, editor: Editor) => {
+        if (!this.settings.plainTextPaste) return;
+        const text = evt.clipboardData?.getData('text/plain');
+        if (text === undefined) return;
+        evt.preventDefault();
+        editor.replaceSelection(text);
+      })
+    );
   }
 
   buildEditorExtensions() {
@@ -258,7 +324,40 @@ export default class IOCHighlighter extends Plugin {
       u.view.dispatch({ changes, annotations: defangTx.of(true) });
     });
 
-    return [colorPlugin, defangListener];
+    // ── Date token replacement ────────────────────────────────────────────────
+
+    const DATE_TOKENS: { pattern: RegExp; value: () => string }[] = [
+      { pattern: /<\$ datetime-now \$>/g, value: utcDateTimeString },
+      { pattern: /<\$ date-now \$>/g,     value: utcDateString },
+    ];
+
+    const dateListener = EditorView.updateListener.of((u: ViewUpdate) => {
+      if (!u.docChanged) return;
+      if (!plugin.settings.dateTokens) return;
+      if (u.transactions.some((tr) => tr.annotation(dateTx))) return;
+
+      const changes: { from: number; to: number; insert: string }[] = [];
+
+      u.changes.iterChangedRanges((_fa, _ta, fb, tb) => {
+        const lo = Math.max(0, fb - 30);
+        const hi = Math.min(u.state.doc.length, tb + 30);
+        const text = u.state.doc.sliceString(lo, hi);
+
+        for (const { pattern, value } of DATE_TOKENS) {
+          pattern.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = pattern.exec(text)) !== null) {
+            changes.push({ from: lo + m.index, to: lo + m.index + m[0].length, insert: value() });
+          }
+        }
+      });
+
+      if (!changes.length) return;
+      changes.sort((a, b) => b.from - a.from);
+      u.view.dispatch({ changes, annotations: dateTx.of(true) });
+    });
+
+    return [colorPlugin, defangListener, dateListener];
   }
 
   // ── Reading View coloring ─────────────────────────────────────────────────
@@ -299,6 +398,8 @@ export default class IOCHighlighter extends Plugin {
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...saved,
+      plainTextPaste: saved.plainTextPaste ?? DEFAULT_SETTINGS.plainTextPaste,
+      dateTokens:     saved.dateTokens     ?? DEFAULT_SETTINGS.dateTokens,
       defang: {
         ips:        { ...DEFAULT_SETTINGS.defang.ips,     ...(saved.defang?.ips     ?? {}) },
         domains:    { ...DEFAULT_SETTINGS.defang.domains, ...(saved.defang?.domains ?? {}) },
@@ -357,6 +458,27 @@ class SettingsTab extends PluginSettingTab {
     // ── Color Rules ──────────────────────────────────────────────────────────
 
     containerEl.createEl('h2', { text: 'CyberScribe' });
+
+    new Setting(containerEl)
+      .setName('Paste as plain text')
+      .setDesc('Strip all formatting when pasting. Overrides Obsidian\'s default paste behaviour.')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.plainTextPaste).onChange(async (v) => {
+          this.plugin.settings.plainTextPaste = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Date tokens')
+      .setDesc('Auto-replace <$ date-now $> with YYYY-MM-DD and <$ datetime-now $> with YYYY-MM-DD HH:mm:ss UTC.')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.dateTokens).onChange(async (v) => {
+          this.plugin.settings.dateTokens = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
     containerEl.createEl('h3', { text: 'Color Rules' });
     containerEl.createEl('p', {
       text: 'Highlight matched text in the editor and reading view. Up to 12 rules.',
