@@ -13,7 +13,7 @@ import {
   ViewPlugin,
   ViewUpdate,
 } from '@codemirror/view';
-import { Annotation, RangeSetBuilder } from '@codemirror/state';
+import { Annotation, RangeSetBuilder, StateEffect } from '@codemirror/state';
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -59,6 +59,8 @@ const FLAT_COLORS = [
   { name: 'Indigo',  value: '#6c5ce7' },
 ] as const;
 
+const VALID_COLORS = new Set(FLAT_COLORS.map((c) => c.value));
+
 const DEFAULT_SETTINGS: PluginSettings = {
   colorRules: [],
   plainTextPaste: false,
@@ -69,7 +71,6 @@ const DEFAULT_SETTINGS: PluginSettings = {
       enabled: true,
     },
     domains: {
-      // Covers common TLDs including .sh and other short TLDs
       regex: String.raw`\b(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+(?:com|net|org|io|sh|gov|edu|co|uk|de|fr|ru|cn|jp|au|ca|info|biz|xyz|top|site|online|tech|me|tv|cc|app|dev|mil|int|us|in|br|nl|se|no|fi|dk|pl|ch|at|be|nz|sg|hk|tw|kr|za|mx|ar|cl|pe|ph|id|th|vn|pk|bd|ng|ke|eg|ma|dz|tn|ly|sd|gh|tz|ci|cm|sn|ug|zm|zw)\b`,
       enabled: true,
     },
@@ -82,7 +83,15 @@ const DEFAULT_SETTINGS: PluginSettings = {
   },
 };
 
-// ─── Scope helper ────────────────────────────────────────────────────────────
+// ─── CM6 effects and annotations ─────────────────────────────────────────────
+
+// Dispatched after saving settings to trigger decoration rebuild in all open editors
+const settingsChangedEffect = StateEffect.define<void>();
+
+const defangTx = Annotation.define<true>();
+const dateTx   = Annotation.define<true>();
+
+// ─── Scope helper ─────────────────────────────────────────────────────────────
 
 function getScopeRanges(
   docText: string,
@@ -95,38 +104,47 @@ function getScopeRanges(
 
   let startRe: RegExp | null = null;
   let endRe: RegExp | null = null;
-  try { if (scopeStart) startRe = new RegExp(scopeStart, 'g'); } catch { /* invalid regex */ }
-  try { if (scopeEnd)   endRe   = new RegExp(scopeEnd,   'g'); } catch { /* invalid regex */ }
+  try { if (scopeStart) startRe = new RegExp(scopeStart, 'g'); } catch { /* invalid */ }
+  try { if (scopeEnd)   endRe   = new RegExp(scopeEnd,   'g'); } catch { /* invalid */ }
 
-  // Both invalid → full doc
   if (scopeStart && !startRe && scopeEnd && !endRe) return [{ from: 0, to: len }];
 
   if (!startRe && endRe) {
-    const m = endRe.exec(docText);
+    const m = safeExec(endRe, docText);
     return [{ from: 0, to: m ? m.index : len }];
   }
 
   if (startRe && !endRe) {
-    const m = startRe.exec(docText);
+    const m = safeExec(startRe, docText);
     return m ? [{ from: m.index + m[0].length, to: len }] : [];
   }
 
   // Both provided: find all paired start→end regions
   const ranges: { from: number; to: number }[] = [];
   let sm: RegExpExecArray | null;
-  while ((sm = startRe!.exec(docText)) !== null) {
+  while ((sm = safeExec(startRe!, docText)) !== null) {
+    // Guard zero-width start match to prevent infinite loop (#1)
+    if (sm[0].length === 0) { startRe!.lastIndex++; continue; }
     const from = sm.index + sm[0].length;
     endRe!.lastIndex = from;
-    const em = endRe!.exec(docText);
+    const em = safeExec(endRe!, docText);
     if (em) {
+      if (em[0].length === 0) endRe!.lastIndex++;
       ranges.push({ from, to: em.index });
-      startRe!.lastIndex = em.index + em[0].length;
+      startRe!.lastIndex = Math.max(startRe!.lastIndex, em.index + em[0].length);
     } else {
       ranges.push({ from, to: len });
       break;
     }
   }
   return ranges;
+}
+
+// Wraps exec and advances lastIndex on zero-width match to prevent infinite loops (#27)
+function safeExec(re: RegExp, text: string): RegExpExecArray | null {
+  const m = re.exec(text);
+  if (m && m[0].length === 0) re.lastIndex++;
+  return m;
 }
 
 // ─── Defang helpers ───────────────────────────────────────────────────────────
@@ -144,11 +162,6 @@ function isDefanged(text: string): boolean {
   return text.includes('[.]') || text.includes('[@]');
 }
 
-// ─── CM6 transaction annotations (prevent re-processing our own transactions) ─
-
-const defangTx = Annotation.define<true>();
-const dateTx   = Annotation.define<true>();
-
 // ─── Date token helpers ───────────────────────────────────────────────────────
 
 function utcDateString(): string {
@@ -165,9 +178,21 @@ function utcDateTimeString(): string {
   return `${date} ${time} UTC`;
 }
 
+// Returns true if a DOM node is inside a code block, pre, or anchor — used to
+// skip coloring inside those elements in reading view (#17)
+function isInsideCodeOrLink(node: Node): boolean {
+  let p = node.parentElement;
+  while (p) {
+    const tag = p.tagName.toLowerCase();
+    if (tag === 'code' || tag === 'pre' || tag === 'a') return true;
+    p = p.parentElement;
+  }
+  return false;
+}
+
 // ─── Main Plugin ──────────────────────────────────────────────────────────────
 
-export default class IOCHighlighter extends Plugin {
+export default class CyberScribe extends Plugin {
   settings: PluginSettings;
 
   async onload() {
@@ -176,21 +201,36 @@ export default class IOCHighlighter extends Plugin {
     this.registerEditorExtension(this.buildEditorExtensions());
     this.registerMarkdownPostProcessor(this.processReadingView.bind(this));
 
+    // ── Commands ─────────────────────────────────────────────────────────────
+
     this.addCommand({
       id: 'process-date-tokens',
       name: 'Process date tokens in note',
       editorCallback: (editor: Editor) => {
-        const tokens: { pattern: RegExp; value: () => string }[] = [
+        const tokens = [
           { pattern: /<\$ datetime-now \$>/g, value: utcDateTimeString },
           { pattern: /<\$ date-now \$>/g,     value: utcDateString },
         ];
-        let content = editor.getValue();
-        let changed = false;
+        const content = editor.getValue();
+        const changes: { from: number; to: number; text: string }[] = [];
+
+        // Snapshot one timestamp per token type so all replacements share the same instant
         for (const { pattern, value } of tokens) {
-          const replaced = content.replace(pattern, () => { changed = true; return value(); });
-          content = replaced;
+          const snapshot = value();
+          pattern.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = pattern.exec(content)) !== null) {
+            if (m[0].length === 0) { pattern.lastIndex++; continue; }
+            changes.push({ from: m.index, to: m.index + m[0].length, text: snapshot });
+          }
         }
-        if (changed) editor.setValue(content);
+
+        if (!changes.length) return;
+        // Apply in reverse order so earlier positions stay valid (#13/#26 — avoids setValue)
+        changes.sort((a, b) => b.from - a.from);
+        for (const { from, to, text } of changes) {
+          editor.replaceRange(text, editor.offsetToPos(from), editor.offsetToPos(to));
+        }
       },
     });
 
@@ -214,7 +254,8 @@ export default class IOCHighlighter extends Plugin {
       this.app.workspace.on('editor-paste', (evt: ClipboardEvent, editor: Editor) => {
         if (!this.settings.plainTextPaste) return;
         const text = evt.clipboardData?.getData('text/plain');
-        if (text === undefined) return;
+        // Guard: empty or missing means non-text content (e.g. image) — don't swallow it (#22)
+        if (!text) return;
         evt.preventDefault();
         editor.replaceSelection(text);
       })
@@ -231,7 +272,14 @@ export default class IOCHighlighter extends Plugin {
         decorations: DecorationSet;
         constructor(view: EditorView) { this.decorations = buildDecorations(view); }
         update(u: ViewUpdate) {
-          if (u.docChanged || u.viewportChanged) this.decorations = buildDecorations(u.view);
+          // Rebuild on doc/viewport change OR when settings were saved (#19)
+          if (
+            u.docChanged ||
+            u.viewportChanged ||
+            u.transactions.some((tr) => tr.effects.some((e) => e.is(settingsChangedEffect)))
+          ) {
+            this.decorations = buildDecorations(u.view);
+          }
         }
       },
       { decorations: (v) => v.decorations }
@@ -248,6 +296,8 @@ export default class IOCHighlighter extends Plugin {
           try { re = new RegExp(rule.regex, 'g'); } catch { continue; }
           let m: RegExpExecArray | null;
           while ((m = re.exec(text)) !== null) {
+            // Guard zero-width match to prevent infinite loop (#27)
+            if (m[0].length === 0) { re.lastIndex++; continue; }
             hits.push({ from: from + m.index, to: from + m.index + m[0].length, color: rule.color });
           }
         }
@@ -283,14 +333,13 @@ export default class IOCHighlighter extends Plugin {
       }
 
       const changes: { from: number; to: number; insert: string }[] = [];
-      // Track replaced ranges to prevent overlapping changes (e.g. email + domain both matching)
       const taken: { from: number; to: number }[] = [];
 
       function overlaps(from: number, to: number): boolean {
         return taken.some((r) => r.from < to && r.to > from);
       }
 
-      // Process emails first — they contain domains, so they get priority
+      // Emails first — they contain domains, so they get priority
       const types: Array<['emails' | 'ips' | 'domains', DefangRule]> = [
         ['emails', plugin.settings.defang.emails],
         ['ips',    plugin.settings.defang.ips],
@@ -298,7 +347,6 @@ export default class IOCHighlighter extends Plugin {
       ];
 
       u.changes.iterChangedRanges((_fa, _ta, fb, tb) => {
-        // Scan 100 chars around each change to catch full IOC patterns
         const lo = Math.max(0, fb - 100);
         const hi = Math.min(u.state.doc.length, tb + 100);
         const text = u.state.doc.sliceString(lo, hi);
@@ -309,6 +357,8 @@ export default class IOCHighlighter extends Plugin {
           try { re = new RegExp(rule.regex, 'g'); } catch { continue; }
           let m: RegExpExecArray | null;
           while ((m = re.exec(text)) !== null) {
+            // Guard zero-width match (#27)
+            if (m[0].length === 0) { re.lastIndex++; continue; }
             const abs = lo + m.index;
             const absEnd = abs + m[0].length;
             if (!inScope(abs, absEnd) || overlaps(abs, absEnd) || isDefanged(m[0])) continue;
@@ -319,14 +369,13 @@ export default class IOCHighlighter extends Plugin {
       });
 
       if (!changes.length) return;
-      // Apply from end → start so positions stay valid
       changes.sort((a, b) => b.from - a.from);
       u.view.dispatch({ changes, annotations: defangTx.of(true) });
     });
 
     // ── Date token replacement ────────────────────────────────────────────────
 
-    const DATE_TOKENS: { pattern: RegExp; value: () => string }[] = [
+    const DATE_TOKENS = [
       { pattern: /<\$ datetime-now \$>/g, value: utcDateTimeString },
       { pattern: /<\$ date-now \$>/g,     value: utcDateString },
     ];
@@ -346,7 +395,9 @@ export default class IOCHighlighter extends Plugin {
         for (const { pattern, value } of DATE_TOKENS) {
           pattern.lastIndex = 0;
           let m: RegExpExecArray | null;
+          // Date token patterns are fixed literals — zero-width guard included for safety (#27)
           while ((m = pattern.exec(text)) !== null) {
+            if (m[0].length === 0) { pattern.lastIndex++; continue; }
             changes.push({ from: lo + m.index, to: lo + m.index + m[0].length, insert: value() });
           }
         }
@@ -372,6 +423,9 @@ export default class IOCHighlighter extends Plugin {
     while ((n = walker.nextNode())) nodes.push(n as Text);
 
     for (const node of nodes) {
+      // Skip text inside code blocks, pre, and links (#17)
+      if (isInsideCodeOrLink(node)) continue;
+
       const text = node.nodeValue ?? '';
       const spans = buildSpans(text, rules);
       if (spans.length === 1 && !spans[0].color) continue;
@@ -380,7 +434,8 @@ export default class IOCHighlighter extends Plugin {
       for (const { text: t, color } of spans) {
         if (color) {
           const s = document.createElement('span');
-          s.style.cssText = `color:${color};font-weight:600`;
+          s.style.color = color;
+          s.style.fontWeight = '600';
           s.textContent = t;
           frag.appendChild(s);
         } else {
@@ -400,6 +455,13 @@ export default class IOCHighlighter extends Plugin {
       ...saved,
       plainTextPaste: saved.plainTextPaste ?? DEFAULT_SETTINGS.plainTextPaste,
       dateTokens:     saved.dateTokens     ?? DEFAULT_SETTINGS.dateTokens,
+      // Sanitize saved color rules — guard against missing/invalid fields from old versions (#10)
+      colorRules: ((saved.colorRules ?? []) as any[]).map((r) => ({
+        id:      typeof r.id      === 'string'  ? r.id      : (crypto.randomUUID?.() ?? Math.random().toString(36)),
+        regex:   typeof r.regex   === 'string'  ? r.regex   : '',
+        color:   VALID_COLORS.has(r.color)      ? r.color   : FLAT_COLORS[0].value,
+        enabled: typeof r.enabled === 'boolean' ? r.enabled : true,
+      })),
       defang: {
         ips:        { ...DEFAULT_SETTINGS.defang.ips,     ...(saved.defang?.ips     ?? {}) },
         domains:    { ...DEFAULT_SETTINGS.defang.domains, ...(saved.defang?.domains ?? {}) },
@@ -412,6 +474,11 @@ export default class IOCHighlighter extends Plugin {
 
   async saveSettings() {
     await this.saveData(this.settings);
+    // Push settingsChangedEffect to all open CM6 editors to trigger decoration rebuild (#19)
+    this.app.workspace.iterateAllLeaves((leaf: any) => {
+      const cm = leaf.view?.editor?.cm as EditorView | undefined;
+      if (cm) cm.dispatch({ effects: settingsChangedEffect.of() });
+    });
   }
 }
 
@@ -425,17 +492,20 @@ function buildSpans(text: string, rules: ColorRule[]): { text: string; color: st
     try { re = new RegExp(rule.regex, 'g'); } catch { continue; }
     let m: RegExpExecArray | null;
     while ((m = re.exec(text)) !== null) {
+      // Guard zero-width match to prevent infinite loop (#27)
+      if (m[0].length === 0) { re.lastIndex++; continue; }
       hits.push({ start: m.index, end: m.index + m[0].length, color: rule.color });
     }
   }
 
   if (!hits.length) return [{ text, color: null }];
 
-  hits.sort((a, b) => a.start - b.start);
+  // Sort by start position; on equal start, first rule (earlier in array) wins (#16)
+  hits.sort((a, b) => a.start - b.start || 0);
   const out: { text: string; color: string | null }[] = [];
   let pos = 0, cursor = 0;
   for (const { start, end, color } of hits) {
-    if (start < cursor) continue; // skip overlapping (first rule wins)
+    if (start < cursor) continue;
     if (pos < start) out.push({ text: text.slice(pos, start), color: null });
     out.push({ text: text.slice(start, end), color });
     pos = cursor = end;
@@ -447,7 +517,7 @@ function buildSpans(text: string, rules: ColorRule[]): { text: string; color: st
 // ─── Settings Tab ─────────────────────────────────────────────────────────────
 
 class SettingsTab extends PluginSettingTab {
-  constructor(app: App, private plugin: IOCHighlighter) {
+  constructor(app: App, private plugin: CyberScribe) {
     super(app, plugin);
   }
 
@@ -455,13 +525,11 @@ class SettingsTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    // ── Color Rules ──────────────────────────────────────────────────────────
-
     containerEl.createEl('h2', { text: 'CyberScribe' });
 
     new Setting(containerEl)
       .setName('Paste as plain text')
-      .setDesc('Strip all formatting when pasting. Overrides Obsidian\'s default paste behaviour.')
+      .setDesc("Strip all formatting when pasting. Overrides Obsidian's default paste behaviour.")
       .addToggle((t) =>
         t.setValue(this.plugin.settings.plainTextPaste).onChange(async (v) => {
           this.plugin.settings.plainTextPaste = v;
@@ -479,6 +547,8 @@ class SettingsTab extends PluginSettingTab {
         })
       );
 
+    // ── Color Rules ──────────────────────────────────────────────────────────
+
     containerEl.createEl('h3', { text: 'Color Rules' });
     containerEl.createEl('p', {
       text: 'Highlight matched text in the editor and reading view. Up to 12 rules.',
@@ -487,12 +557,11 @@ class SettingsTab extends PluginSettingTab {
 
     const rules = this.plugin.settings.colorRules;
 
-    for (let i = 0; i < rules.length; i++) {
-      const rule = rules[i];
+    for (const rule of rules) {
       const colorMeta = FLAT_COLORS.find((c) => c.value === rule.color) ?? FLAT_COLORS[0];
+      let swatch: HTMLElement;
 
       new Setting(containerEl)
-        .setName(`Rule ${i + 1}`)
         .addText((t) =>
           t
             .setPlaceholder('Regex pattern  e.g.  ---OODA---')
@@ -501,21 +570,27 @@ class SettingsTab extends PluginSettingTab {
         )
         .addDropdown((d) => {
           FLAT_COLORS.forEach((c) => d.addOption(c.value, c.name));
-          d.setValue(rule.color).onChange(async (v) => { rule.color = v; await this.plugin.saveSettings(); this.display(); });
+          // Don't call display() on color change — update swatch in-place to preserve scroll (#24)
+          d.setValue(rule.color).onChange(async (v) => {
+            rule.color = v;
+            await this.plugin.saveSettings();
+            if (swatch) swatch.style.background = v;
+          });
         })
         .addToggle((t) =>
           t.setValue(rule.enabled).onChange(async (v) => { rule.enabled = v; await this.plugin.saveSettings(); })
         )
         .addButton((b) =>
+          // Use rule.id to find the rule rather than captured index to avoid race on double-click (#25)
           b.setButtonText('✕').setWarning().onClick(async () => {
-            rules.splice(i, 1);
+            const idx = rules.findIndex((r) => r.id === rule.id);
+            if (idx !== -1) rules.splice(idx, 1);
             await this.plugin.saveSettings();
             this.display();
           })
         )
-        // Color swatch after the controls
         .then((s) => {
-          s.controlEl.createEl('span', {
+          swatch = s.controlEl.createEl('span', {
             attr: {
               style: `display:inline-block;width:14px;height:14px;border-radius:50%;background:${rule.color};margin-left:6px;vertical-align:middle;`,
               title: colorMeta.name,
@@ -528,7 +603,7 @@ class SettingsTab extends PluginSettingTab {
       new Setting(containerEl).addButton((b) =>
         b.setButtonText('+ Add Rule').setCta().onClick(async () => {
           rules.push({
-            id: crypto.randomUUID(),
+            id: crypto.randomUUID?.() ?? Math.random().toString(36).slice(2),
             regex: '',
             color: FLAT_COLORS[rules.length % FLAT_COLORS.length].value,
             enabled: true,
