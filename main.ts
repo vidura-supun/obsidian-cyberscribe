@@ -248,7 +248,7 @@ export default class CyberScribe extends Plugin {
 
     this.addCommand({
       id: 'insert-date',
-      name: 'Insert current date (YYYY-MM-DD)',
+      name: 'Insert current date',
       editorCallback: (editor: Editor) => {
         editor.replaceSelection(utcDateString());
       },
@@ -256,7 +256,7 @@ export default class CyberScribe extends Plugin {
 
     this.addCommand({
       id: 'insert-datetime',
-      name: 'Insert current datetime (YYYY-MM-DD HH:mm:ss UTC)',
+      name: 'Insert current datetime',
       editorCallback: (editor: Editor) => {
         editor.replaceSelection(utcDateTimeString());
       },
@@ -275,30 +275,10 @@ export default class CyberScribe extends Plugin {
   }
 
   buildEditorExtensions() {
-    const plugin = this;
-
     // ── Live Preview coloring ────────────────────────────────────────────────
 
-    const colorPlugin = ViewPlugin.fromClass(
-      class {
-        decorations: DecorationSet;
-        constructor(view: EditorView) { this.decorations = buildDecorations(view); }
-        update(u: ViewUpdate) {
-          // Rebuild on doc/viewport change OR when settings were saved (#19)
-          if (
-            u.docChanged ||
-            u.viewportChanged ||
-            u.transactions.some((tr) => tr.effects.some((e) => e.is(settingsChangedEffect)))
-          ) {
-            this.decorations = buildDecorations(u.view);
-          }
-        }
-      },
-      { decorations: (v) => v.decorations }
-    );
-
-    function buildDecorations(view: EditorView): DecorationSet {
-      const rules = plugin.settings.colorRules.filter((r) => r.enabled && r.regex);
+    const buildDecorations = (view: EditorView): DecorationSet => {
+      const rules = this.settings.colorRules.filter((r) => r.enabled && r.regex);
       const hits: { from: number; to: number; color: string }[] = [];
 
       for (const { from, to } of view.visibleRanges) {
@@ -325,7 +305,25 @@ export default class CyberScribe extends Plugin {
         }
       }
       return builder.finish();
-    }
+    };
+
+    const colorPlugin = ViewPlugin.fromClass(
+      class {
+        decorations: DecorationSet;
+        constructor(view: EditorView) { this.decorations = buildDecorations(view); }
+        update(u: ViewUpdate) {
+          // Rebuild on doc/viewport change OR when settings were saved (#19)
+          if (
+            u.docChanged ||
+            u.viewportChanged ||
+            u.transactions.some((tr) => tr.effects.some((e) => e.is(settingsChangedEffect)))
+          ) {
+            this.decorations = buildDecorations(u.view);
+          }
+        }
+      },
+      { decorations: (v) => v.decorations }
+    );
 
     // ── Auto-defang on type ──────────────────────────────────────────────────
 
@@ -336,8 +334,8 @@ export default class CyberScribe extends Plugin {
       const docText = u.state.doc.toString();
       const scopeRanges = getScopeRanges(
         docText,
-        plugin.settings.defang.scopeStart,
-        plugin.settings.defang.scopeEnd
+        this.settings.defang.scopeStart,
+        this.settings.defang.scopeEnd
       );
 
       function inScope(from: number, to: number): boolean {
@@ -353,10 +351,10 @@ export default class CyberScribe extends Plugin {
 
       // URLs first (contain domains/emails), then emails (contain domains), then IPs, then domains
       const types: Array<['urls' | 'emails' | 'ips' | 'domains', DefangRule]> = [
-        ['urls',    plugin.settings.defang.urls],
-        ['emails',  plugin.settings.defang.emails],
-        ['ips',     plugin.settings.defang.ips],
-        ['domains', plugin.settings.defang.domains],
+        ['urls',    this.settings.defang.urls],
+        ['emails',  this.settings.defang.emails],
+        ['ips',     this.settings.defang.ips],
+        ['domains', this.settings.defang.domains],
       ];
 
       u.changes.iterChangedRanges((_fa, _ta, fb, tb) => {
@@ -395,7 +393,7 @@ export default class CyberScribe extends Plugin {
 
     const dateListener = EditorView.updateListener.of((u: ViewUpdate) => {
       if (!u.docChanged) return;
-      if (!plugin.settings.dateTokens) return;
+      if (!this.settings.dateTokens) return;
       if (u.transactions.some((tr) => tr.annotation(dateTx))) return;
 
       const changes: { from: number; to: number; insert: string }[] = [];
@@ -448,7 +446,7 @@ export default class CyberScribe extends Plugin {
         if (color) {
           const s = document.createElement('span');
           s.style.color = color;
-          s.style.fontWeight = '600';
+          s.classList.add('cyberscribe-highlight');
           s.textContent = t;
           frag.appendChild(s);
         } else {
@@ -469,10 +467,10 @@ export default class CyberScribe extends Plugin {
       plainTextPaste: saved.plainTextPaste ?? DEFAULT_SETTINGS.plainTextPaste,
       dateTokens:     saved.dateTokens     ?? DEFAULT_SETTINGS.dateTokens,
       // Sanitize saved color rules — guard against missing/invalid fields from old versions (#10)
-      colorRules: ((saved.colorRules ?? []) as any[]).map((r) => ({
+      colorRules: ((saved.colorRules ?? []) as Record<string, unknown>[]).map((r) => ({
         id:      typeof r.id      === 'string'  ? r.id      : (crypto.randomUUID?.() ?? Math.random().toString(36)),
         regex:   typeof r.regex   === 'string'  ? r.regex   : '',
-        color:   VALID_COLORS.has(r.color)      ? r.color   : FLAT_COLORS[0].value,
+        color:   (VALID_COLORS as Set<string>).has(r.color as string) ? (r.color as typeof FLAT_COLORS[number]['value']) : FLAT_COLORS[0].value,
         enabled: typeof r.enabled === 'boolean' ? r.enabled : true,
       })),
       defang: {
@@ -489,8 +487,8 @@ export default class CyberScribe extends Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
     // Push settingsChangedEffect to all open CM6 editors to trigger decoration rebuild (#19)
-    this.app.workspace.iterateAllLeaves((leaf: any) => {
-      const cm = leaf.view?.editor?.cm as EditorView | undefined;
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const cm = (leaf.view as { editor?: { cm?: EditorView } }).editor?.cm;
       if (cm) cm.dispatch({ effects: settingsChangedEffect.of() });
     });
   }
@@ -539,7 +537,7 @@ class SettingsTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl('h2', { text: 'CyberScribe' });
+    new Setting(containerEl).setName('CyberScribe').setHeading();
 
     new Setting(containerEl)
       .setName('Paste as plain text')
@@ -553,7 +551,7 @@ class SettingsTab extends PluginSettingTab {
 
     new Setting(containerEl)
       .setName('Date tokens')
-      .setDesc('Auto-replace <$ date-now $> with YYYY-MM-DD and <$ datetime-now $> with YYYY-MM-DD HH:mm:ss UTC.')
+      .setDesc('Auto-replace date-now tokens with today\'s date and datetime-now tokens with the current UTC timestamp.')
       .addToggle((t) =>
         t.setValue(this.plugin.settings.dateTokens).onChange(async (v) => {
           this.plugin.settings.dateTokens = v;
@@ -563,11 +561,10 @@ class SettingsTab extends PluginSettingTab {
 
     // ── Color Rules ──────────────────────────────────────────────────────────
 
-    containerEl.createEl('h3', { text: 'Color Rules' });
-    containerEl.createEl('p', {
-      text: 'Highlight matched text in the editor and reading view. Up to 12 rules.',
-      attr: { style: 'color: var(--text-muted); margin-top: 0;' },
-    });
+    new Setting(containerEl)
+      .setName('Color rules')
+      .setDesc('Highlight matched text in the editor and reading view. Up to 12 rules.')
+      .setHeading();
 
     const rules = this.plugin.settings.colorRules;
 
@@ -578,16 +575,16 @@ class SettingsTab extends PluginSettingTab {
       new Setting(containerEl)
         .addText((t) =>
           t
-            .setPlaceholder('Regex pattern  e.g.  ---OODA---')
+            .setPlaceholder('Regex pattern, e.g. ---OODA---')
             .setValue(rule.regex)
             .onChange(async (v) => { rule.regex = v; await this.plugin.saveSettings(); })
         )
         .addDropdown((d) => {
           FLAT_COLORS.forEach((c) => d.addOption(c.value, c.name));
           // Don't call display() on color change — update swatch in-place to preserve scroll (#24)
-          d.setValue(rule.color).onChange(async (v) => {
+          d.setValue(rule.color).onChange((v) => {
             rule.color = v;
-            await this.plugin.saveSettings();
+            void this.plugin.saveSettings();
             if (swatch) swatch.style.background = v;
           });
         })
@@ -615,7 +612,7 @@ class SettingsTab extends PluginSettingTab {
 
     if (rules.length < 12) {
       new Setting(containerEl).addButton((b) =>
-        b.setButtonText('+ Add Rule').setCta().onClick(async () => {
+        b.setButtonText('+ Add rule').setCta().onClick(async () => {
           rules.push({
             id: crypto.randomUUID?.() ?? Math.random().toString(36).slice(2),
             regex: '',
@@ -630,17 +627,15 @@ class SettingsTab extends PluginSettingTab {
 
     // ── Defang Rules ─────────────────────────────────────────────────────────
 
-    containerEl.createEl('h3', { text: 'Auto-Defang' });
-    containerEl.createEl('p', {
-      text: 'Automatically rewrites matching IOCs as you type. Modifies file content.',
-      attr: { style: 'color: var(--text-muted); margin-top: 0;' },
-    });
+    new Setting(containerEl)
+      .setName('Auto-defang')
+      .setDesc('Automatically rewrites matching IOCs as you type. Modifies file content.')
+      .setHeading();
 
-    containerEl.createEl('h3', { text: 'Scope' });
-    containerEl.createEl('p', {
-      text: 'Limit defanging to the region between two regex markers. Leave blank to apply to the whole note.',
-      attr: { style: 'color: var(--text-muted); margin-top: 0;' },
-    });
+    new Setting(containerEl)
+      .setName('Scope')
+      .setDesc('Limit defanging to the region between two regex markers. Leave blank to apply to the whole note.')
+      .setHeading();
 
     new Setting(containerEl)
       .setName('Scope start')
@@ -662,11 +657,11 @@ class SettingsTab extends PluginSettingTab {
           .onChange(async (v) => { this.plugin.settings.defang.scopeEnd = v; await this.plugin.saveSettings(); })
       );
 
-    containerEl.createEl('h3', { text: 'IOC Types' });
+    new Setting(containerEl).setName('IOC types').setHeading();
 
     const defangEntries: Array<[keyof Pick<PluginSettings['defang'], 'ips' | 'domains' | 'emails' | 'urls'>, string, string]> = [
       ['urls',    'URLs',         'https://evil.com  →  hxxps://evil.com'],
-      ['ips',     'IP Addresses', '1.2.3.4  →  1[.]2[.]3[.]4'],
+      ['ips',     'IP addresses', '1.2.3.4  →  1[.]2[.]3[.]4'],
       ['domains', 'Domains',      'evil.sh  →  evil[.]sh'],
       ['emails',  'Emails',       'a@evil.com  →  a[@]evil[.]com'],
     ];

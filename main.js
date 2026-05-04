@@ -199,14 +199,14 @@ var CyberScribe = class extends import_obsidian.Plugin {
     });
     this.addCommand({
       id: "insert-date",
-      name: "Insert current date (YYYY-MM-DD)",
+      name: "Insert current date",
       editorCallback: (editor) => {
         editor.replaceSelection(utcDateString());
       }
     });
     this.addCommand({
       id: "insert-datetime",
-      name: "Insert current datetime (YYYY-MM-DD HH:mm:ss UTC)",
+      name: "Insert current datetime",
       editorCallback: (editor) => {
         editor.replaceSelection(utcDateTimeString());
       }
@@ -225,22 +225,8 @@ var CyberScribe = class extends import_obsidian.Plugin {
     );
   }
   buildEditorExtensions() {
-    const plugin = this;
-    const colorPlugin = import_view.ViewPlugin.fromClass(
-      class {
-        constructor(view) {
-          this.decorations = buildDecorations(view);
-        }
-        update(u) {
-          if (u.docChanged || u.viewportChanged || u.transactions.some((tr) => tr.effects.some((e) => e.is(settingsChangedEffect)))) {
-            this.decorations = buildDecorations(u.view);
-          }
-        }
-      },
-      { decorations: (v) => v.decorations }
-    );
-    function buildDecorations(view) {
-      const rules = plugin.settings.colorRules.filter((r) => r.enabled && r.regex);
+    const buildDecorations = (view) => {
+      const rules = this.settings.colorRules.filter((r) => r.enabled && r.regex);
       const hits = [];
       for (const { from, to } of view.visibleRanges) {
         const text = view.state.doc.sliceString(from, to);
@@ -271,7 +257,20 @@ var CyberScribe = class extends import_obsidian.Plugin {
         }
       }
       return builder.finish();
-    }
+    };
+    const colorPlugin = import_view.ViewPlugin.fromClass(
+      class {
+        constructor(view) {
+          this.decorations = buildDecorations(view);
+        }
+        update(u) {
+          if (u.docChanged || u.viewportChanged || u.transactions.some((tr) => tr.effects.some((e) => e.is(settingsChangedEffect)))) {
+            this.decorations = buildDecorations(u.view);
+          }
+        }
+      },
+      { decorations: (v) => v.decorations }
+    );
     const defangListener = import_view.EditorView.updateListener.of((u) => {
       if (!u.docChanged)
         return;
@@ -280,8 +279,8 @@ var CyberScribe = class extends import_obsidian.Plugin {
       const docText = u.state.doc.toString();
       const scopeRanges = getScopeRanges(
         docText,
-        plugin.settings.defang.scopeStart,
-        plugin.settings.defang.scopeEnd
+        this.settings.defang.scopeStart,
+        this.settings.defang.scopeEnd
       );
       function inScope(from, to) {
         return scopeRanges.some((r) => from >= r.from && to <= r.to);
@@ -292,10 +291,10 @@ var CyberScribe = class extends import_obsidian.Plugin {
         return taken.some((r) => r.from < to && r.to > from);
       }
       const types = [
-        ["urls", plugin.settings.defang.urls],
-        ["emails", plugin.settings.defang.emails],
-        ["ips", plugin.settings.defang.ips],
-        ["domains", plugin.settings.defang.domains]
+        ["urls", this.settings.defang.urls],
+        ["emails", this.settings.defang.emails],
+        ["ips", this.settings.defang.ips],
+        ["domains", this.settings.defang.domains]
       ];
       u.changes.iterChangedRanges((_fa, _ta, fb, tb) => {
         const lo = Math.max(0, fb - 100);
@@ -337,7 +336,7 @@ var CyberScribe = class extends import_obsidian.Plugin {
     const dateListener = import_view.EditorView.updateListener.of((u) => {
       if (!u.docChanged)
         return;
-      if (!plugin.settings.dateTokens)
+      if (!this.settings.dateTokens)
         return;
       if (u.transactions.some((tr) => tr.annotation(dateTx)))
         return;
@@ -388,7 +387,7 @@ var CyberScribe = class extends import_obsidian.Plugin {
         if (color) {
           const s = document.createElement("span");
           s.style.color = color;
-          s.style.fontWeight = "600";
+          s.classList.add("cyberscribe-highlight");
           s.textContent = t;
           frag.appendChild(s);
         } else {
@@ -430,8 +429,8 @@ var CyberScribe = class extends import_obsidian.Plugin {
   async saveSettings() {
     await this.saveData(this.settings);
     this.app.workspace.iterateAllLeaves((leaf) => {
-      var _a, _b;
-      const cm = (_b = (_a = leaf.view) == null ? void 0 : _a.editor) == null ? void 0 : _b.cm;
+      var _a;
+      const cm = (_a = leaf.view.editor) == null ? void 0 : _a.cm;
       if (cm)
         cm.dispatch({ effects: settingsChangedEffect.of() });
     });
@@ -481,38 +480,34 @@ var SettingsTab = class extends import_obsidian.PluginSettingTab {
     var _a;
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl("h2", { text: "CyberScribe" });
+    new import_obsidian.Setting(containerEl).setName("CyberScribe").setHeading();
     new import_obsidian.Setting(containerEl).setName("Paste as plain text").setDesc("Strip all formatting when pasting. Overrides Obsidian's default paste behaviour.").addToggle(
       (t) => t.setValue(this.plugin.settings.plainTextPaste).onChange(async (v) => {
         this.plugin.settings.plainTextPaste = v;
         await this.plugin.saveSettings();
       })
     );
-    new import_obsidian.Setting(containerEl).setName("Date tokens").setDesc("Auto-replace <$ date-now $> with YYYY-MM-DD and <$ datetime-now $> with YYYY-MM-DD HH:mm:ss UTC.").addToggle(
+    new import_obsidian.Setting(containerEl).setName("Date tokens").setDesc("Auto-replace date-now tokens with today's date and datetime-now tokens with the current UTC timestamp.").addToggle(
       (t) => t.setValue(this.plugin.settings.dateTokens).onChange(async (v) => {
         this.plugin.settings.dateTokens = v;
         await this.plugin.saveSettings();
       })
     );
-    containerEl.createEl("h3", { text: "Color Rules" });
-    containerEl.createEl("p", {
-      text: "Highlight matched text in the editor and reading view. Up to 12 rules.",
-      attr: { style: "color: var(--text-muted); margin-top: 0;" }
-    });
+    new import_obsidian.Setting(containerEl).setName("Color rules").setDesc("Highlight matched text in the editor and reading view. Up to 12 rules.").setHeading();
     const rules = this.plugin.settings.colorRules;
     for (const rule of rules) {
       const colorMeta = (_a = FLAT_COLORS.find((c) => c.value === rule.color)) != null ? _a : FLAT_COLORS[0];
       let swatch;
       new import_obsidian.Setting(containerEl).addText(
-        (t) => t.setPlaceholder("Regex pattern  e.g.  ---OODA---").setValue(rule.regex).onChange(async (v) => {
+        (t) => t.setPlaceholder("Regex pattern, e.g. ---OODA---").setValue(rule.regex).onChange(async (v) => {
           rule.regex = v;
           await this.plugin.saveSettings();
         })
       ).addDropdown((d) => {
         FLAT_COLORS.forEach((c) => d.addOption(c.value, c.name));
-        d.setValue(rule.color).onChange(async (v) => {
+        d.setValue(rule.color).onChange((v) => {
           rule.color = v;
-          await this.plugin.saveSettings();
+          void this.plugin.saveSettings();
           if (swatch)
             swatch.style.background = v;
         });
@@ -543,7 +538,7 @@ var SettingsTab = class extends import_obsidian.PluginSettingTab {
     }
     if (rules.length < 12) {
       new import_obsidian.Setting(containerEl).addButton(
-        (b) => b.setButtonText("+ Add Rule").setCta().onClick(async () => {
+        (b) => b.setButtonText("+ Add rule").setCta().onClick(async () => {
           var _a2, _b;
           rules.push({
             id: (_b = (_a2 = crypto.randomUUID) == null ? void 0 : _a2.call(crypto)) != null ? _b : Math.random().toString(36).slice(2),
@@ -556,16 +551,8 @@ var SettingsTab = class extends import_obsidian.PluginSettingTab {
         })
       );
     }
-    containerEl.createEl("h3", { text: "Auto-Defang" });
-    containerEl.createEl("p", {
-      text: "Automatically rewrites matching IOCs as you type. Modifies file content.",
-      attr: { style: "color: var(--text-muted); margin-top: 0;" }
-    });
-    containerEl.createEl("h3", { text: "Scope" });
-    containerEl.createEl("p", {
-      text: "Limit defanging to the region between two regex markers. Leave blank to apply to the whole note.",
-      attr: { style: "color: var(--text-muted); margin-top: 0;" }
-    });
+    new import_obsidian.Setting(containerEl).setName("Auto-defang").setDesc("Automatically rewrites matching IOCs as you type. Modifies file content.").setHeading();
+    new import_obsidian.Setting(containerEl).setName("Scope").setDesc("Limit defanging to the region between two regex markers. Leave blank to apply to the whole note.").setHeading();
     new import_obsidian.Setting(containerEl).setName("Scope start").setDesc("Defang begins after the first match of this regex").addText(
       (t) => t.setPlaceholder("e.g.  ---IOC-START---").setValue(this.plugin.settings.defang.scopeStart).onChange(async (v) => {
         this.plugin.settings.defang.scopeStart = v;
@@ -578,10 +565,10 @@ var SettingsTab = class extends import_obsidian.PluginSettingTab {
         await this.plugin.saveSettings();
       })
     );
-    containerEl.createEl("h3", { text: "IOC Types" });
+    new import_obsidian.Setting(containerEl).setName("IOC types").setHeading();
     const defangEntries = [
       ["urls", "URLs", "https://evil.com  \u2192  hxxps://evil.com"],
-      ["ips", "IP Addresses", "1.2.3.4  \u2192  1[.]2[.]3[.]4"],
+      ["ips", "IP addresses", "1.2.3.4  \u2192  1[.]2[.]3[.]4"],
       ["domains", "Domains", "evil.sh  \u2192  evil[.]sh"],
       ["emails", "Emails", "a@evil.com  \u2192  a[@]evil[.]com"]
     ];
