@@ -57,6 +57,10 @@ var DEFAULT_SETTINGS = {
       regex: String.raw`\b[a-zA-Z0-9._%+\-]+@(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}\b`,
       enabled: true
     },
+    urls: {
+      regex: String.raw`https?://[^\s<>"'\]]+`,
+      enabled: true
+    },
     scopeStart: "",
     scopeEnd: ""
   }
@@ -119,6 +123,9 @@ function safeExec(re, text) {
   return m;
 }
 function defangText(text, type) {
+  if (type === "urls") {
+    return text.replace(/^https?/i, (m) => m.replace(/http/i, "hxxp"));
+  }
   if (type === "ips" || type === "domains") {
     return text.replace(/\./g, "[.]");
   }
@@ -127,8 +134,10 @@ function defangText(text, type) {
     return text;
   return text.slice(0, atIdx) + "[@]" + text.slice(atIdx + 1).replace(/\./g, "[.]");
 }
-function isDefanged(text) {
-  return text.includes("[.]") || text.includes("[@]");
+function isDefanged(text, type) {
+  if (type === "urls")
+    return /^hxxps?:\/\//i.test(text);
+  return text.includes("[.]") || text.includes("[@]") || /hxxps?:\/\//i.test(text);
 }
 function utcDateString() {
   const now = new Date();
@@ -283,6 +292,7 @@ var CyberScribe = class extends import_obsidian.Plugin {
         return taken.some((r) => r.from < to && r.to > from);
       }
       const types = [
+        ["urls", plugin.settings.defang.urls],
         ["emails", plugin.settings.defang.emails],
         ["ips", plugin.settings.defang.ips],
         ["domains", plugin.settings.defang.domains]
@@ -308,7 +318,7 @@ var CyberScribe = class extends import_obsidian.Plugin {
             }
             const abs = lo + m.index;
             const absEnd = abs + m[0].length;
-            if (!inScope(abs, absEnd) || overlaps(abs, absEnd) || isDefanged(m[0]))
+            if (!inScope(abs, absEnd) || overlaps(abs, absEnd) || isDefanged(m[0], type))
               continue;
             taken.push({ from: abs, to: absEnd });
             changes.push({ from: abs, to: absEnd, insert: defangText(m[0], type) });
@@ -390,7 +400,7 @@ var CyberScribe = class extends import_obsidian.Plugin {
   }
   // ── Settings persistence ──────────────────────────────────────────────────
   async loadSettings() {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p;
     const saved = (_a = await this.loadData()) != null ? _a : {};
     this.settings = {
       ...DEFAULT_SETTINGS,
@@ -411,8 +421,9 @@ var CyberScribe = class extends import_obsidian.Plugin {
         ips: { ...DEFAULT_SETTINGS.defang.ips, ...(_f = (_e = saved.defang) == null ? void 0 : _e.ips) != null ? _f : {} },
         domains: { ...DEFAULT_SETTINGS.defang.domains, ...(_h = (_g = saved.defang) == null ? void 0 : _g.domains) != null ? _h : {} },
         emails: { ...DEFAULT_SETTINGS.defang.emails, ...(_j = (_i = saved.defang) == null ? void 0 : _i.emails) != null ? _j : {} },
-        scopeStart: (_l = (_k = saved.defang) == null ? void 0 : _k.scopeStart) != null ? _l : "",
-        scopeEnd: (_n = (_m = saved.defang) == null ? void 0 : _m.scopeEnd) != null ? _n : ""
+        urls: { ...DEFAULT_SETTINGS.defang.urls, ...(_l = (_k = saved.defang) == null ? void 0 : _k.urls) != null ? _l : {} },
+        scopeStart: (_n = (_m = saved.defang) == null ? void 0 : _m.scopeStart) != null ? _n : "",
+        scopeEnd: (_p = (_o = saved.defang) == null ? void 0 : _o.scopeEnd) != null ? _p : ""
       }
     };
   }
@@ -569,6 +580,7 @@ var SettingsTab = class extends import_obsidian.PluginSettingTab {
     );
     containerEl.createEl("h3", { text: "IOC Types" });
     const defangEntries = [
+      ["urls", "URLs", "https://evil.com  \u2192  hxxps://evil.com"],
       ["ips", "IP Addresses", "1.2.3.4  \u2192  1[.]2[.]3[.]4"],
       ["domains", "Domains", "evil.sh  \u2192  evil[.]sh"],
       ["emails", "Emails", "a@evil.com  \u2192  a[@]evil[.]com"]

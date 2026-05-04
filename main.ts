@@ -37,6 +37,7 @@ interface PluginSettings {
     ips: DefangRule;
     domains: DefangRule;
     emails: DefangRule;
+    urls: DefangRule;
     scopeStart: string;
     scopeEnd: string;
   };
@@ -76,6 +77,10 @@ const DEFAULT_SETTINGS: PluginSettings = {
     },
     emails: {
       regex: String.raw`\b[a-zA-Z0-9._%+\-]+@(?:[a-zA-Z0-9\-]+\.)+[a-zA-Z]{2,}\b`,
+      enabled: true,
+    },
+    urls: {
+      regex: String.raw`https?://[^\s<>"'\]]+`,
       enabled: true,
     },
     scopeStart: '',
@@ -149,7 +154,10 @@ function safeExec(re: RegExp, text: string): RegExpExecArray | null {
 
 // ─── Defang helpers ───────────────────────────────────────────────────────────
 
-function defangText(text: string, type: 'ips' | 'domains' | 'emails'): string {
+function defangText(text: string, type: 'ips' | 'domains' | 'emails' | 'urls'): string {
+  if (type === 'urls') {
+    return text.replace(/^https?/i, (m) => m.replace(/http/i, 'hxxp'));
+  }
   if (type === 'ips' || type === 'domains') {
     return text.replace(/\./g, '[.]');
   }
@@ -158,8 +166,12 @@ function defangText(text: string, type: 'ips' | 'domains' | 'emails'): string {
   return text.slice(0, atIdx) + '[@]' + text.slice(atIdx + 1).replace(/\./g, '[.]');
 }
 
-function isDefanged(text: string): boolean {
-  return text.includes('[.]') || text.includes('[@]');
+function isDefanged(text: string, type?: 'ips' | 'domains' | 'emails' | 'urls'): boolean {
+  // For URLs, only the scheme matters — a URL with [.] in its host but a live
+  // http(s):// scheme must still be defanged. Conversely a URL whose scheme is
+  // already hxxp(s):// should be skipped regardless of bracketed host.
+  if (type === 'urls') return /^hxxps?:\/\//i.test(text);
+  return text.includes('[.]') || text.includes('[@]') || /hxxps?:\/\//i.test(text);
 }
 
 // ─── Date token helpers ───────────────────────────────────────────────────────
@@ -339,10 +351,11 @@ export default class CyberScribe extends Plugin {
         return taken.some((r) => r.from < to && r.to > from);
       }
 
-      // Emails first — they contain domains, so they get priority
-      const types: Array<['emails' | 'ips' | 'domains', DefangRule]> = [
-        ['emails', plugin.settings.defang.emails],
-        ['ips',    plugin.settings.defang.ips],
+      // URLs first (contain domains/emails), then emails (contain domains), then IPs, then domains
+      const types: Array<['urls' | 'emails' | 'ips' | 'domains', DefangRule]> = [
+        ['urls',    plugin.settings.defang.urls],
+        ['emails',  plugin.settings.defang.emails],
+        ['ips',     plugin.settings.defang.ips],
         ['domains', plugin.settings.defang.domains],
       ];
 
@@ -361,7 +374,7 @@ export default class CyberScribe extends Plugin {
             if (m[0].length === 0) { re.lastIndex++; continue; }
             const abs = lo + m.index;
             const absEnd = abs + m[0].length;
-            if (!inScope(abs, absEnd) || overlaps(abs, absEnd) || isDefanged(m[0])) continue;
+            if (!inScope(abs, absEnd) || overlaps(abs, absEnd) || isDefanged(m[0], type)) continue;
             taken.push({ from: abs, to: absEnd });
             changes.push({ from: abs, to: absEnd, insert: defangText(m[0], type) });
           }
@@ -466,6 +479,7 @@ export default class CyberScribe extends Plugin {
         ips:        { ...DEFAULT_SETTINGS.defang.ips,     ...(saved.defang?.ips     ?? {}) },
         domains:    { ...DEFAULT_SETTINGS.defang.domains, ...(saved.defang?.domains ?? {}) },
         emails:     { ...DEFAULT_SETTINGS.defang.emails,  ...(saved.defang?.emails  ?? {}) },
+        urls:       { ...DEFAULT_SETTINGS.defang.urls,    ...(saved.defang?.urls    ?? {}) },
         scopeStart: saved.defang?.scopeStart ?? '',
         scopeEnd:   saved.defang?.scopeEnd   ?? '',
       },
@@ -650,7 +664,8 @@ class SettingsTab extends PluginSettingTab {
 
     containerEl.createEl('h3', { text: 'IOC Types' });
 
-    const defangEntries: Array<[keyof Pick<PluginSettings['defang'], 'ips' | 'domains' | 'emails'>, string, string]> = [
+    const defangEntries: Array<[keyof Pick<PluginSettings['defang'], 'ips' | 'domains' | 'emails' | 'urls'>, string, string]> = [
+      ['urls',    'URLs',         'https://evil.com  →  hxxps://evil.com'],
       ['ips',     'IP Addresses', '1.2.3.4  →  1[.]2[.]3[.]4'],
       ['domains', 'Domains',      'evil.sh  →  evil[.]sh'],
       ['emails',  'Emails',       'a@evil.com  →  a[@]evil[.]com'],
