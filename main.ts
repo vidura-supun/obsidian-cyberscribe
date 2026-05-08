@@ -5,6 +5,9 @@ import {
   Plugin,
   PluginSettingTab,
   Setting,
+  Notice,
+  ItemView,
+  WorkspaceLeaf,
 } from 'obsidian';
 import {
   Decoration,
@@ -33,6 +36,8 @@ interface PluginSettings {
   colorRules: ColorRule[];
   plainTextPaste: boolean;
   dateTokens: boolean;
+  timerEnabled: boolean;
+  timerFolder: string;
   defang: {
     ips: DefangRule;
     domains: DefangRule;
@@ -62,10 +67,16 @@ const FLAT_COLORS = [
 
 const VALID_COLORS = new Set(FLAT_COLORS.map((c) => c.value));
 
+const INVESTIGATION_DURATION = 45 * 60 * 1000;
+const ACTION_DURATION        = 20 * 60 * 1000;
+const TIMER_VIEW_TYPE        = 'cyberscribe-timer';
+
 const DEFAULT_SETTINGS: PluginSettings = {
   colorRules: [],
   plainTextPaste: false,
   dateTokens: true,
+  timerEnabled: true,
+  timerFolder: '',
   defang: {
     ips: {
       regex: String.raw`\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b`,
@@ -207,11 +218,125 @@ function isInsideCodeOrLink(node: Node): boolean {
 export default class CyberScribe extends Plugin {
   settings: PluginSettings;
 
+  timerState: 'idle' | 'investigating' | 'acting' = 'idle';
+  private timerElapsedAccum = 0;
+  private timerLastStart: number | null = null;
+  private timerInterval: number | null = null;
+  private timerBar: HTMLElement | null = null;
+  private emptyOnOpen = new Set<string>();
+
+  timerElapsedMs(): number {
+    return this.timerElapsedAccum + (this.timerLastStart !== null ? Date.now() - this.timerLastStart : 0);
+  }
+
+  formatTime(ms: number): string {
+    const s = Math.floor(ms / 1000);
+    const pad = (n: number) => String(n).padStart(2, '0');
+    return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
+  }
+
+  updateTimerBar() {
+    if (this.timerBar) {
+      if (!this.settings.timerEnabled || this.timerState === 'idle') {
+        this.timerBar.style.display = 'none';
+      } else {
+        this.timerBar.style.display = 'inline-flex';
+        const duration = this.timerState === 'investigating' ? INVESTIGATION_DURATION : ACTION_DURATION;
+        const remaining = Math.max(0, duration - this.timerElapsedMs());
+        const icon = this.timerState === 'investigating' ? '🔍' : '✏️';
+        this.timerBar.setText(`${icon} ${this.formatTime(remaining)}`);
+      }
+    }
+    this.refreshTimerView();
+  }
+
+  private refreshTimerView() {
+    this.app.workspace.getLeavesOfType(TIMER_VIEW_TYPE).forEach((leaf) => {
+      (leaf.view as TimerView).refresh();
+    });
+  }
+
+  async openTimerPanel() {
+    const existing = this.app.workspace.getLeavesOfType(TIMER_VIEW_TYPE);
+    if (existing.length) { this.app.workspace.revealLeaf(existing[0]); return; }
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (leaf) {
+      await leaf.setViewState({ type: TIMER_VIEW_TYPE, active: true });
+      this.app.workspace.revealLeaf(leaf);
+    }
+  }
+
+  startInvestigation() {
+    this.timerState = 'investigating';
+    this.timerElapsedAccum = 0;
+    this.timerLastStart = Date.now();
+    this.timerInterval = window.setInterval(() => {
+      if (this.timerElapsedMs() >= INVESTIGATION_DURATION) {
+        clearInterval(this.timerInterval!);
+        this.timerInterval = null;
+        this.timerElapsedAccum = INVESTIGATION_DURATION;
+        this.timerLastStart = null;
+        this.updateTimerBar();
+        new Notice('CyberScribe: Investigation time is up!');
+        return;
+      }
+      this.updateTimerBar();
+    }, 1000);
+    this.updateTimerBar();
+  }
+
+  handleTimerClick() {
+    if (this.timerState === 'investigating') {
+      if (this.timerInterval !== null) { clearInterval(this.timerInterval); this.timerInterval = null; }
+      this.timerState = 'acting';
+      this.timerElapsedAccum = 0;
+      this.timerLastStart = Date.now();
+      this.timerInterval = window.setInterval(() => {
+        if (this.timerElapsedMs() >= ACTION_DURATION) {
+          clearInterval(this.timerInterval!);
+          this.timerInterval = null;
+          this.timerElapsedAccum = ACTION_DURATION;
+          this.timerLastStart = null;
+          this.updateTimerBar();
+          new Notice('CyberScribe: Action time is up!');
+          return;
+        }
+        this.updateTimerBar();
+      }, 1000);
+      this.updateTimerBar();
+    } else if (this.timerState === 'acting') {
+      this.resetTimer();
+    }
+  }
+
+  resetTimer() {
+    if (this.timerInterval !== null) { clearInterval(this.timerInterval); this.timerInterval = null; }
+    this.timerState = 'idle';
+    this.timerElapsedAccum = 0;
+    this.timerLastStart = null;
+    this.updateTimerBar();
+  }
+
+  private inTimerScope(file: { path: string } | null): boolean {
+    if (!file) return false;
+    const folder = this.settings.timerFolder.trim().replace(/\/+$/, '');
+    if (!folder) return true;
+    return file.path.startsWith(folder + '/');
+  }
+
   async onload() {
     await this.loadSettings();
     this.addSettingTab(new SettingsTab(this.app, this));
     this.registerEditorExtension(this.buildEditorExtensions());
     this.registerMarkdownPostProcessor(this.processReadingView.bind(this));
+    this.app.workspace.detachLeavesOfType(TIMER_VIEW_TYPE);
+    this.registerView(TIMER_VIEW_TYPE, (leaf) => new TimerView(leaf, this));
+    this.addRibbonIcon('clock', 'Open investigation timer', () => this.openTimerPanel());
+    this.addCommand({
+      id: 'open-timer-panel',
+      name: 'Open investigation timer panel',
+      callback: () => this.openTimerPanel(),
+    });
 
     // ── Commands ─────────────────────────────────────────────────────────────
 
@@ -264,14 +389,64 @@ export default class CyberScribe extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on('editor-paste', (evt: ClipboardEvent, editor: Editor) => {
-        if (!this.settings.plainTextPaste) return;
-        const text = evt.clipboardData?.getData('text/plain');
-        // Guard: empty or missing means non-text content (e.g. image) — don't swallow it (#22)
-        if (!text) return;
-        evt.preventDefault();
-        editor.replaceSelection(text);
+        if (this.settings.plainTextPaste) {
+          const text = evt.clipboardData?.getData('text/plain');
+          // Guard: empty or missing means non-text content (e.g. image) — don't swallow it (#22)
+          if (text) { evt.preventDefault(); editor.replaceSelection(text); }
+        }
       })
     );
+
+    // ── Timer ────────────────────────────────────────────────────────────────
+
+    // Track notes that were empty when opened so we can start the timer on first content
+    this.registerEvent(
+      this.app.workspace.on('active-leaf-change', () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || !this.settings.timerEnabled) return;
+        this.app.vault.read(file).then((content) => {
+          if (content.trim() === '') {
+            this.emptyOnOpen.add(file.path);
+          } else {
+            this.emptyOnOpen.delete(file.path);
+          }
+        });
+      })
+    );
+
+    this.registerEvent(
+      this.app.vault.on('modify', (file) => {
+        if (!this.settings.timerEnabled || this.timerState !== 'idle') return;
+        if (!this.emptyOnOpen.has(file.path)) return;
+        if (!this.inTimerScope(file)) return;
+        this.emptyOnOpen.delete(file.path);
+        this.startInvestigation();
+      })
+    );
+
+    this.addCommand({
+      id: 'investigation-start',
+      name: 'Investigation: Start timer',
+      callback: () => {
+        if (this.timerState === 'idle') this.startInvestigation();
+      },
+    });
+
+    this.addCommand({
+      id: 'investigation-reset',
+      name: 'Investigation: Reset timer',
+      callback: () => this.resetTimer(),
+    });
+
+    this.timerBar = this.addStatusBarItem();
+    this.timerBar.addClass('cyberscribe-timer');
+    this.timerBar.addEventListener('click', () => this.handleTimerClick());
+    this.updateTimerBar();
+  }
+
+  onunload() {
+    if (this.timerInterval !== null) clearInterval(this.timerInterval);
+    this.app.workspace.detachLeavesOfType(TIMER_VIEW_TYPE);
   }
 
   buildEditorExtensions() {
@@ -466,6 +641,8 @@ export default class CyberScribe extends Plugin {
       ...saved,
       plainTextPaste: saved.plainTextPaste ?? DEFAULT_SETTINGS.plainTextPaste,
       dateTokens:     saved.dateTokens     ?? DEFAULT_SETTINGS.dateTokens,
+      timerEnabled:   saved.timerEnabled   ?? DEFAULT_SETTINGS.timerEnabled,
+      timerFolder:    saved.timerFolder    ?? DEFAULT_SETTINGS.timerFolder,
       // Sanitize saved color rules — guard against missing/invalid fields from old versions (#10)
       colorRules: ((saved.colorRules ?? []) as Record<string, unknown>[]).map((r) => ({
         id:      typeof r.id      === 'string'  ? r.id      : (crypto.randomUUID?.() ?? Math.random().toString(36)),
@@ -526,6 +703,93 @@ function buildSpans(text: string, rules: ColorRule[]): { text: string; color: st
   return out;
 }
 
+// ─── Timer Panel View ─────────────────────────────────────────────────────────
+
+class TimerView extends ItemView {
+  private phaseEl: HTMLElement | null = null;
+  private timeEl: HTMLElement | null = null;
+  private btnEl: HTMLElement | null = null;
+  private lastRenderedState = '';
+
+  constructor(leaf: WorkspaceLeaf, private plugin: CyberScribe) {
+    super(leaf);
+  }
+
+  getViewType()    { return TIMER_VIEW_TYPE; }
+  getDisplayText() { return 'Investigation Timer'; }
+  getIcon()        { return 'clock'; }
+
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass('cs-timer-panel');
+
+    new Setting(contentEl)
+      .setName('Investigation timer')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.timerEnabled).onChange(async (v) => {
+          this.plugin.settings.timerEnabled = v;
+          if (!v) this.plugin.resetTimer();
+          await this.plugin.saveSettings();
+          this.plugin.updateTimerBar();
+        })
+      );
+
+    this.phaseEl = contentEl.createDiv('cs-timer-phase');
+    this.timeEl  = contentEl.createDiv('cs-timer-time');
+    this.btnEl   = contentEl.createDiv('cs-timer-buttons');
+    this.refresh();
+  }
+
+  refresh() {
+    if (!this.phaseEl || !this.timeEl || !this.btnEl) return;
+
+    const { timerState: state, settings } = this.plugin;
+
+    if (!settings.timerEnabled) {
+      this.phaseEl.setText('Timer disabled');
+      this.timeEl.setText('');
+      if (this.lastRenderedState !== 'disabled') {
+        this.lastRenderedState = 'disabled';
+        this.btnEl.empty();
+      }
+      return;
+    }
+
+    const duration  = state === 'investigating' ? INVESTIGATION_DURATION : ACTION_DURATION;
+    const remaining = Math.max(0, duration - this.plugin.timerElapsedMs());
+
+    if (state === 'idle') {
+      this.phaseEl.setText('No active investigation');
+      this.timeEl.setText('–');
+    } else if (state === 'investigating') {
+      this.phaseEl.setText('🔍  Investigation');
+      this.timeEl.setText(this.plugin.formatTime(remaining));
+    } else {
+      this.phaseEl.setText('✏️  Taking Action');
+      this.timeEl.setText(this.plugin.formatTime(remaining));
+    }
+
+    if (state !== this.lastRenderedState) {
+      this.lastRenderedState = state;
+      this.btnEl.empty();
+      if (state === 'idle') {
+        const btn = this.btnEl.createEl('button', { text: 'Start Investigation', cls: 'mod-cta cs-timer-btn' });
+        btn.addEventListener('click', () => this.plugin.startInvestigation());
+      } else if (state === 'investigating') {
+        const act = this.btnEl.createEl('button', { text: 'Take Action  ✏️', cls: 'cs-timer-btn' });
+        act.addEventListener('click', () => this.plugin.handleTimerClick());
+        const rst = this.btnEl.createEl('button', { text: 'Reset', cls: 'mod-warning cs-timer-btn' });
+        rst.addEventListener('click', () => this.plugin.resetTimer());
+      } else {
+        const stop = this.btnEl.createEl('button', { text: 'Stop', cls: 'mod-warning cs-timer-btn' });
+        stop.addEventListener('click', () => this.plugin.resetTimer());
+      }
+    }
+  }
+
+  async onClose() {}
+}
+
 // ─── Settings Tab ─────────────────────────────────────────────────────────────
 
 class SettingsTab extends PluginSettingTab {
@@ -557,6 +821,31 @@ class SettingsTab extends PluginSettingTab {
           this.plugin.settings.dateTokens = v;
           await this.plugin.saveSettings();
         })
+      );
+
+    new Setting(containerEl)
+      .setName('Investigation timer')
+      .setDesc('Auto-start a 45-minute countdown when content is pasted into an empty note. Click the status bar item to switch to Taking Action (⚡), click again to stop.')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.timerEnabled).onChange(async (v) => {
+          this.plugin.settings.timerEnabled = v;
+          if (!v) this.plugin.resetTimer();
+          await this.plugin.saveSettings();
+          this.plugin.updateTimerBar();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Investigation timer folder')
+      .setDesc('Only auto-start the timer for notes inside this folder (e.g. Investigations). Leave blank to apply vault-wide.')
+      .addText((t) =>
+        t
+          .setPlaceholder('e.g. Investigations')
+          .setValue(this.plugin.settings.timerFolder)
+          .onChange(async (v) => {
+            this.plugin.settings.timerFolder = v;
+            await this.plugin.saveSettings();
+          })
       );
 
     // ── Color Rules ──────────────────────────────────────────────────────────

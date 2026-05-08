@@ -1,3 +1,40 @@
 .cyberscribe-highlight {
   font-weight: 600;
 }
+
+.cyberscribe-timer {
+  cursor: pointer;
+}
+
+.cs-timer-panel {
+  padding: 20px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.cs-timer-phase {
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.cs-timer-time {
+  font-size: 56px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
+  color: var(--text-normal);
+}
+
+.cs-timer-buttons {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.cs-timer-btn {
+  cursor: pointer;
+}

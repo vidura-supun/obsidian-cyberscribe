@@ -40,10 +40,15 @@ var FLAT_COLORS = [
   { name: "Indigo", value: "#6c5ce7" }
 ];
 var VALID_COLORS = new Set(FLAT_COLORS.map((c) => c.value));
+var INVESTIGATION_DURATION = 45 * 60 * 1e3;
+var ACTION_DURATION = 20 * 60 * 1e3;
+var TIMER_VIEW_TYPE = "cyberscribe-timer";
 var DEFAULT_SETTINGS = {
   colorRules: [],
   plainTextPaste: false,
   dateTokens: true,
+  timerEnabled: true,
+  timerFolder: "",
   defang: {
     ips: {
       regex: String.raw`\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b`,
@@ -162,11 +167,129 @@ function isInsideCodeOrLink(node) {
   return false;
 }
 var CyberScribe = class extends import_obsidian.Plugin {
+  constructor() {
+    super(...arguments);
+    this.timerState = "idle";
+    this.timerElapsedAccum = 0;
+    this.timerLastStart = null;
+    this.timerInterval = null;
+    this.timerBar = null;
+    this.emptyOnOpen = /* @__PURE__ */ new Set();
+  }
+  timerElapsedMs() {
+    return this.timerElapsedAccum + (this.timerLastStart !== null ? Date.now() - this.timerLastStart : 0);
+  }
+  formatTime(ms) {
+    const s = Math.floor(ms / 1e3);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(Math.floor(s / 60))}:${pad(s % 60)}`;
+  }
+  updateTimerBar() {
+    if (this.timerBar) {
+      if (!this.settings.timerEnabled || this.timerState === "idle") {
+        this.timerBar.style.display = "none";
+      } else {
+        this.timerBar.style.display = "inline-flex";
+        const duration = this.timerState === "investigating" ? INVESTIGATION_DURATION : ACTION_DURATION;
+        const remaining = Math.max(0, duration - this.timerElapsedMs());
+        const icon = this.timerState === "investigating" ? "\u{1F50D}" : "\u270F\uFE0F";
+        this.timerBar.setText(`${icon} ${this.formatTime(remaining)}`);
+      }
+    }
+    this.refreshTimerView();
+  }
+  refreshTimerView() {
+    this.app.workspace.getLeavesOfType(TIMER_VIEW_TYPE).forEach((leaf) => {
+      leaf.view.refresh();
+    });
+  }
+  async openTimerPanel() {
+    const existing = this.app.workspace.getLeavesOfType(TIMER_VIEW_TYPE);
+    if (existing.length) {
+      this.app.workspace.revealLeaf(existing[0]);
+      return;
+    }
+    const leaf = this.app.workspace.getRightLeaf(false);
+    if (leaf) {
+      await leaf.setViewState({ type: TIMER_VIEW_TYPE, active: true });
+      this.app.workspace.revealLeaf(leaf);
+    }
+  }
+  startInvestigation() {
+    this.timerState = "investigating";
+    this.timerElapsedAccum = 0;
+    this.timerLastStart = Date.now();
+    this.timerInterval = window.setInterval(() => {
+      if (this.timerElapsedMs() >= INVESTIGATION_DURATION) {
+        clearInterval(this.timerInterval);
+        this.timerInterval = null;
+        this.timerElapsedAccum = INVESTIGATION_DURATION;
+        this.timerLastStart = null;
+        this.updateTimerBar();
+        new import_obsidian.Notice("CyberScribe: Investigation time is up!");
+        return;
+      }
+      this.updateTimerBar();
+    }, 1e3);
+    this.updateTimerBar();
+  }
+  handleTimerClick() {
+    if (this.timerState === "investigating") {
+      if (this.timerInterval !== null) {
+        clearInterval(this.timerInterval);
+        this.timerInterval = null;
+      }
+      this.timerState = "acting";
+      this.timerElapsedAccum = 0;
+      this.timerLastStart = Date.now();
+      this.timerInterval = window.setInterval(() => {
+        if (this.timerElapsedMs() >= ACTION_DURATION) {
+          clearInterval(this.timerInterval);
+          this.timerInterval = null;
+          this.timerElapsedAccum = ACTION_DURATION;
+          this.timerLastStart = null;
+          this.updateTimerBar();
+          new import_obsidian.Notice("CyberScribe: Action time is up!");
+          return;
+        }
+        this.updateTimerBar();
+      }, 1e3);
+      this.updateTimerBar();
+    } else if (this.timerState === "acting") {
+      this.resetTimer();
+    }
+  }
+  resetTimer() {
+    if (this.timerInterval !== null) {
+      clearInterval(this.timerInterval);
+      this.timerInterval = null;
+    }
+    this.timerState = "idle";
+    this.timerElapsedAccum = 0;
+    this.timerLastStart = null;
+    this.updateTimerBar();
+  }
+  inTimerScope(file) {
+    if (!file)
+      return false;
+    const folder = this.settings.timerFolder.trim().replace(/\/+$/, "");
+    if (!folder)
+      return true;
+    return file.path.startsWith(folder + "/");
+  }
   async onload() {
     await this.loadSettings();
     this.addSettingTab(new SettingsTab(this.app, this));
     this.registerEditorExtension(this.buildEditorExtensions());
     this.registerMarkdownPostProcessor(this.processReadingView.bind(this));
+    this.app.workspace.detachLeavesOfType(TIMER_VIEW_TYPE);
+    this.registerView(TIMER_VIEW_TYPE, (leaf) => new TimerView(leaf, this));
+    this.addRibbonIcon("clock", "Open investigation timer", () => this.openTimerPanel());
+    this.addCommand({
+      id: "open-timer-panel",
+      name: "Open investigation timer panel",
+      callback: () => this.openTimerPanel()
+    });
     this.addCommand({
       id: "process-date-tokens",
       name: "Process date tokens in note",
@@ -214,15 +337,63 @@ var CyberScribe = class extends import_obsidian.Plugin {
     this.registerEvent(
       this.app.workspace.on("editor-paste", (evt, editor) => {
         var _a;
-        if (!this.settings.plainTextPaste)
-          return;
-        const text = (_a = evt.clipboardData) == null ? void 0 : _a.getData("text/plain");
-        if (!text)
-          return;
-        evt.preventDefault();
-        editor.replaceSelection(text);
+        if (this.settings.plainTextPaste) {
+          const text = (_a = evt.clipboardData) == null ? void 0 : _a.getData("text/plain");
+          if (text) {
+            evt.preventDefault();
+            editor.replaceSelection(text);
+          }
+        }
       })
     );
+    this.registerEvent(
+      this.app.workspace.on("active-leaf-change", () => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || !this.settings.timerEnabled)
+          return;
+        this.app.vault.read(file).then((content) => {
+          if (content.trim() === "") {
+            this.emptyOnOpen.add(file.path);
+          } else {
+            this.emptyOnOpen.delete(file.path);
+          }
+        });
+      })
+    );
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (!this.settings.timerEnabled || this.timerState !== "idle")
+          return;
+        if (!this.emptyOnOpen.has(file.path))
+          return;
+        if (!this.inTimerScope(file))
+          return;
+        this.emptyOnOpen.delete(file.path);
+        this.startInvestigation();
+      })
+    );
+    this.addCommand({
+      id: "investigation-start",
+      name: "Investigation: Start timer",
+      callback: () => {
+        if (this.timerState === "idle")
+          this.startInvestigation();
+      }
+    });
+    this.addCommand({
+      id: "investigation-reset",
+      name: "Investigation: Reset timer",
+      callback: () => this.resetTimer()
+    });
+    this.timerBar = this.addStatusBarItem();
+    this.timerBar.addClass("cyberscribe-timer");
+    this.timerBar.addEventListener("click", () => this.handleTimerClick());
+    this.updateTimerBar();
+  }
+  onunload() {
+    if (this.timerInterval !== null)
+      clearInterval(this.timerInterval);
+    this.app.workspace.detachLeavesOfType(TIMER_VIEW_TYPE);
   }
   buildEditorExtensions() {
     const buildDecorations = (view) => {
@@ -399,15 +570,17 @@ var CyberScribe = class extends import_obsidian.Plugin {
   }
   // ── Settings persistence ──────────────────────────────────────────────────
   async loadSettings() {
-    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p;
+    var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p, _q, _r;
     const saved = (_a = await this.loadData()) != null ? _a : {};
     this.settings = {
       ...DEFAULT_SETTINGS,
       ...saved,
       plainTextPaste: (_b = saved.plainTextPaste) != null ? _b : DEFAULT_SETTINGS.plainTextPaste,
       dateTokens: (_c = saved.dateTokens) != null ? _c : DEFAULT_SETTINGS.dateTokens,
+      timerEnabled: (_d = saved.timerEnabled) != null ? _d : DEFAULT_SETTINGS.timerEnabled,
+      timerFolder: (_e = saved.timerFolder) != null ? _e : DEFAULT_SETTINGS.timerFolder,
       // Sanitize saved color rules — guard against missing/invalid fields from old versions (#10)
-      colorRules: ((_d = saved.colorRules) != null ? _d : []).map((r) => {
+      colorRules: ((_f = saved.colorRules) != null ? _f : []).map((r) => {
         var _a2, _b2;
         return {
           id: typeof r.id === "string" ? r.id : (_b2 = (_a2 = crypto.randomUUID) == null ? void 0 : _a2.call(crypto)) != null ? _b2 : Math.random().toString(36),
@@ -417,12 +590,12 @@ var CyberScribe = class extends import_obsidian.Plugin {
         };
       }),
       defang: {
-        ips: { ...DEFAULT_SETTINGS.defang.ips, ...(_f = (_e = saved.defang) == null ? void 0 : _e.ips) != null ? _f : {} },
-        domains: { ...DEFAULT_SETTINGS.defang.domains, ...(_h = (_g = saved.defang) == null ? void 0 : _g.domains) != null ? _h : {} },
-        emails: { ...DEFAULT_SETTINGS.defang.emails, ...(_j = (_i = saved.defang) == null ? void 0 : _i.emails) != null ? _j : {} },
-        urls: { ...DEFAULT_SETTINGS.defang.urls, ...(_l = (_k = saved.defang) == null ? void 0 : _k.urls) != null ? _l : {} },
-        scopeStart: (_n = (_m = saved.defang) == null ? void 0 : _m.scopeStart) != null ? _n : "",
-        scopeEnd: (_p = (_o = saved.defang) == null ? void 0 : _o.scopeEnd) != null ? _p : ""
+        ips: { ...DEFAULT_SETTINGS.defang.ips, ...(_h = (_g = saved.defang) == null ? void 0 : _g.ips) != null ? _h : {} },
+        domains: { ...DEFAULT_SETTINGS.defang.domains, ...(_j = (_i = saved.defang) == null ? void 0 : _i.domains) != null ? _j : {} },
+        emails: { ...DEFAULT_SETTINGS.defang.emails, ...(_l = (_k = saved.defang) == null ? void 0 : _k.emails) != null ? _l : {} },
+        urls: { ...DEFAULT_SETTINGS.defang.urls, ...(_n = (_m = saved.defang) == null ? void 0 : _m.urls) != null ? _n : {} },
+        scopeStart: (_p = (_o = saved.defang) == null ? void 0 : _o.scopeStart) != null ? _p : "",
+        scopeEnd: (_r = (_q = saved.defang) == null ? void 0 : _q.scopeEnd) != null ? _r : ""
       }
     };
   }
@@ -471,6 +644,86 @@ function buildSpans(text, rules) {
     out.push({ text: text.slice(pos), color: null });
   return out;
 }
+var TimerView = class extends import_obsidian.ItemView {
+  constructor(leaf, plugin) {
+    super(leaf);
+    this.plugin = plugin;
+    this.phaseEl = null;
+    this.timeEl = null;
+    this.btnEl = null;
+    this.lastRenderedState = "";
+  }
+  getViewType() {
+    return TIMER_VIEW_TYPE;
+  }
+  getDisplayText() {
+    return "Investigation Timer";
+  }
+  getIcon() {
+    return "clock";
+  }
+  async onOpen() {
+    const { contentEl } = this;
+    contentEl.addClass("cs-timer-panel");
+    new import_obsidian.Setting(contentEl).setName("Investigation timer").addToggle(
+      (t) => t.setValue(this.plugin.settings.timerEnabled).onChange(async (v) => {
+        this.plugin.settings.timerEnabled = v;
+        if (!v)
+          this.plugin.resetTimer();
+        await this.plugin.saveSettings();
+        this.plugin.updateTimerBar();
+      })
+    );
+    this.phaseEl = contentEl.createDiv("cs-timer-phase");
+    this.timeEl = contentEl.createDiv("cs-timer-time");
+    this.btnEl = contentEl.createDiv("cs-timer-buttons");
+    this.refresh();
+  }
+  refresh() {
+    if (!this.phaseEl || !this.timeEl || !this.btnEl)
+      return;
+    const { timerState: state, settings } = this.plugin;
+    if (!settings.timerEnabled) {
+      this.phaseEl.setText("Timer disabled");
+      this.timeEl.setText("");
+      if (this.lastRenderedState !== "disabled") {
+        this.lastRenderedState = "disabled";
+        this.btnEl.empty();
+      }
+      return;
+    }
+    const duration = state === "investigating" ? INVESTIGATION_DURATION : ACTION_DURATION;
+    const remaining = Math.max(0, duration - this.plugin.timerElapsedMs());
+    if (state === "idle") {
+      this.phaseEl.setText("No active investigation");
+      this.timeEl.setText("\u2013");
+    } else if (state === "investigating") {
+      this.phaseEl.setText("\u{1F50D}  Investigation");
+      this.timeEl.setText(this.plugin.formatTime(remaining));
+    } else {
+      this.phaseEl.setText("\u270F\uFE0F  Taking Action");
+      this.timeEl.setText(this.plugin.formatTime(remaining));
+    }
+    if (state !== this.lastRenderedState) {
+      this.lastRenderedState = state;
+      this.btnEl.empty();
+      if (state === "idle") {
+        const btn = this.btnEl.createEl("button", { text: "Start Investigation", cls: "mod-cta cs-timer-btn" });
+        btn.addEventListener("click", () => this.plugin.startInvestigation());
+      } else if (state === "investigating") {
+        const act = this.btnEl.createEl("button", { text: "Take Action  \u270F\uFE0F", cls: "cs-timer-btn" });
+        act.addEventListener("click", () => this.plugin.handleTimerClick());
+        const rst = this.btnEl.createEl("button", { text: "Reset", cls: "mod-warning cs-timer-btn" });
+        rst.addEventListener("click", () => this.plugin.resetTimer());
+      } else {
+        const stop = this.btnEl.createEl("button", { text: "Stop", cls: "mod-warning cs-timer-btn" });
+        stop.addEventListener("click", () => this.plugin.resetTimer());
+      }
+    }
+  }
+  async onClose() {
+  }
+};
 var SettingsTab = class extends import_obsidian.PluginSettingTab {
   constructor(app, plugin) {
     super(app, plugin);
@@ -490,6 +743,21 @@ var SettingsTab = class extends import_obsidian.PluginSettingTab {
     new import_obsidian.Setting(containerEl).setName("Date tokens").setDesc("Auto-replace date-now tokens with today's date and datetime-now tokens with the current UTC timestamp.").addToggle(
       (t) => t.setValue(this.plugin.settings.dateTokens).onChange(async (v) => {
         this.plugin.settings.dateTokens = v;
+        await this.plugin.saveSettings();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Investigation timer").setDesc("Auto-start a 45-minute countdown when content is pasted into an empty note. Click the status bar item to switch to Taking Action (\u26A1), click again to stop.").addToggle(
+      (t) => t.setValue(this.plugin.settings.timerEnabled).onChange(async (v) => {
+        this.plugin.settings.timerEnabled = v;
+        if (!v)
+          this.plugin.resetTimer();
+        await this.plugin.saveSettings();
+        this.plugin.updateTimerBar();
+      })
+    );
+    new import_obsidian.Setting(containerEl).setName("Investigation timer folder").setDesc("Only auto-start the timer for notes inside this folder (e.g. Investigations). Leave blank to apply vault-wide.").addText(
+      (t) => t.setPlaceholder("e.g. Investigations").setValue(this.plugin.settings.timerFolder).onChange(async (v) => {
+        this.plugin.settings.timerFolder = v;
         await this.plugin.saveSettings();
       })
     );
