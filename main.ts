@@ -46,6 +46,12 @@ interface PluginSettings {
     scopeStart: string;
     scopeEnd: string;
   };
+  timeConvert: {
+    enabled: boolean;
+    timezoneOffset: string;
+    scopeStart: string;
+    scopeEnd: string;
+  };
 }
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -94,6 +100,12 @@ const DEFAULT_SETTINGS: PluginSettings = {
       regex: String.raw`https?://[^\s<>"'\]]+`,
       enabled: true,
     },
+    scopeStart: '',
+    scopeEnd: '',
+  },
+  timeConvert: {
+    enabled: false,
+    timezoneOffset: '+0',
     scopeStart: '',
     scopeEnd: '',
   },
@@ -211,6 +223,48 @@ function isInsideCodeOrLink(node: Node): boolean {
     p = p.parentElement;
   }
   return false;
+}
+
+// ─── Time conversion helpers ──────────────────────────────────────────────────
+
+const MONTH_INDEX: Record<string, number> = {
+  jan: 0, feb: 1, mar: 2, apr: 3, may: 4, jun: 5,
+  jul: 6, aug: 7, sep: 8, oct: 9, nov: 10, dec: 11,
+};
+
+function parseTimezoneOffset(tz: string): number {
+  const s = tz.trim().replace(/^UTC/i, '');
+  const m = s.match(/^([+-]?)(\d{1,2})(?::(\d{2}))?$/);
+  if (!m) return 0;
+  const sign = m[1] === '-' ? -1 : 1;
+  return sign * (parseInt(m[2]) + (m[3] ? parseInt(m[3]) / 60 : 0));
+}
+
+function formatOffset(offsetHours: number): string {
+  const sign = offsetHours >= 0 ? '+' : '-';
+  const abs = Math.abs(offsetHours);
+  const h = Math.floor(abs);
+  const mins = Math.round((abs - h) * 60);
+  return mins > 0 ? `UTC${sign}${h}:${String(mins).padStart(2, '0')}` : `UTC${sign}${h}`;
+}
+
+function convertTimestamps(text: string, offsetHours: number): string {
+  const pad = (n: number) => String(n).padStart(2, '0');
+  const tzLabel = formatOffset(offsetHours);
+  // Matches: May 27, 2026 12:17 PM  or  May 27, 2026 04:15:43 PM  (seconds optional)
+  const re = /\b(Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|June?|July?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+(\d{1,2}),\s+(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)\b/gi;
+  return text.replace(re, (match, monthStr, dayStr, yearStr, hourStr, minStr, _secStr, ampm) => {
+    const month = MONTH_INDEX[monthStr.slice(0, 3).toLowerCase()] ?? 0;
+    let hour = parseInt(hourStr);
+    const min = parseInt(minStr);
+    if (ampm.toUpperCase() === 'AM') { if (hour === 12) hour = 0; }
+    else { if (hour !== 12) hour += 12; }
+    const utcMs = Date.UTC(parseInt(yearStr), month, parseInt(dayStr), hour, min)
+      - Math.round(offsetHours * 60) * 60000;
+    const d = new Date(utcMs);
+    const utcStr = `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`;
+    return `${utcStr} (${match} ${tzLabel})`;
+  });
 }
 
 // ─── Main Plugin ──────────────────────────────────────────────────────────────
@@ -387,12 +441,48 @@ export default class CyberScribe extends Plugin {
       },
     });
 
+    this.addCommand({
+      id: 'convert-timestamps',
+      name: 'Convert local timestamps to UTC (selection or whole note)',
+      editorCallback: (editor: Editor) => {
+        const tc = this.settings.timeConvert;
+        if (!tc.enabled) { new Notice('CyberScribe: Time conversion is disabled in settings'); return; }
+        const sel = editor.getSelection();
+        const input = sel || editor.getValue();
+        const converted = convertTimestamps(input, parseTimezoneOffset(tc.timezoneOffset));
+        if (converted === input) { new Notice('CyberScribe: No timestamp patterns found'); return; }
+        if (sel) editor.replaceSelection(converted);
+        else editor.setValue(converted);
+        new Notice('CyberScribe: Timestamps converted to UTC');
+      },
+    });
+
     this.registerEvent(
       this.app.workspace.on('editor-paste', (evt: ClipboardEvent, editor: Editor) => {
-        if (this.settings.plainTextPaste) {
-          const text = evt.clipboardData?.getData('text/plain');
-          // Guard: empty or missing means non-text content (e.g. image) — don't swallow it (#22)
-          if (text) { evt.preventDefault(); editor.replaceSelection(text); }
+        const text = evt.clipboardData?.getData('text/plain');
+        // Guard: empty or missing means non-text content (e.g. image) — don't swallow it (#22)
+        if (!text) return;
+
+        let result = text;
+        const tc = this.settings.timeConvert;
+
+        if (tc.enabled) {
+          const docText = editor.getValue();
+          const cursorOffset = editor.posToOffset(editor.getCursor());
+          const scopeRanges = getScopeRanges(docText, tc.scopeStart, tc.scopeEnd);
+          const inScope = scopeRanges.some((r) => cursorOffset >= r.from && cursorOffset <= r.to);
+          if (inScope) {
+            const converted = convertTimestamps(result, parseTimezoneOffset(tc.timezoneOffset));
+            if (converted !== result) {
+              result = converted;
+              new Notice('CyberScribe: Timestamps converted to UTC');
+            }
+          }
+        }
+
+        if (this.settings.plainTextPaste || result !== text) {
+          evt.preventDefault();
+          editor.replaceSelection(result);
         }
       })
     );
@@ -657,6 +747,12 @@ export default class CyberScribe extends Plugin {
         urls:       { ...DEFAULT_SETTINGS.defang.urls,    ...(saved.defang?.urls    ?? {}) },
         scopeStart: saved.defang?.scopeStart ?? '',
         scopeEnd:   saved.defang?.scopeEnd   ?? '',
+      },
+      timeConvert: {
+        enabled:        saved.timeConvert?.enabled        ?? false,
+        timezoneOffset: saved.timeConvert?.timezoneOffset ?? '+0',
+        scopeStart:     saved.timeConvert?.scopeStart     ?? '',
+        scopeEnd:       saved.timeConvert?.scopeEnd       ?? '',
       },
     };
   }
@@ -969,5 +1065,66 @@ class SettingsTab extends PluginSettingTab {
           t.setValue(rule.enabled).onChange(async (v) => { rule.enabled = v; await this.plugin.saveSettings(); })
         );
     }
+
+    // ── Local time → UTC conversion ──────────────────────────────────────────
+
+    new Setting(containerEl)
+      .setName('Local time → UTC conversion')
+      .setDesc('On paste, convert timestamps like "May 27, 2026 12:17 PM" to UTC. Original time is kept in brackets.')
+      .setHeading();
+
+    new Setting(containerEl)
+      .setName('Enable')
+      .setDesc('Convert local timestamps to UTC when pasting.')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.timeConvert.enabled).onChange(async (v) => {
+          this.plugin.settings.timeConvert.enabled = v;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('Local timezone')
+      .setDesc('UTC offset of the source timestamps. Examples: +8 for UTC+8, -5 for UTC-5, +5:30 for IST.')
+      .addText((t) =>
+        t
+          .setPlaceholder('+8')
+          .setValue(this.plugin.settings.timeConvert.timezoneOffset)
+          .onChange(async (v) => {
+            this.plugin.settings.timeConvert.timezoneOffset = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Scope')
+      .setDesc('Limit conversion to the region between two regex markers. Leave blank to apply to the whole note.')
+      .setHeading();
+
+    new Setting(containerEl)
+      .setName('Scope start')
+      .setDesc('Conversion applies only after the first match of this regex.')
+      .addText((t) =>
+        t
+          .setPlaceholder('e.g.  ---EVENTS-START---')
+          .setValue(this.plugin.settings.timeConvert.scopeStart)
+          .onChange(async (v) => {
+            this.plugin.settings.timeConvert.scopeStart = v;
+            await this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Scope end')
+      .setDesc('Conversion stops before the first match of this regex after the start.')
+      .addText((t) =>
+        t
+          .setPlaceholder('e.g.  ---EVENTS-END---')
+          .setValue(this.plugin.settings.timeConvert.scopeEnd)
+          .onChange(async (v) => {
+            this.plugin.settings.timeConvert.scopeEnd = v;
+            await this.plugin.saveSettings();
+          })
+      );
   }
 }

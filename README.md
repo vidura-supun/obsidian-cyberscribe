@@ -1,6 +1,6 @@
 # CyberScribe
 
-An [Obsidian](https://obsidian.md) plugin for threat intelligence and security analysts that highlights text by regex, automatically defangs IOCs as you type, and tracks investigation time with a built-in countdown timer.
+An [Obsidian](https://obsidian.md) plugin for threat intelligence and security analysts that highlights text by regex, automatically defangs IOCs as you type, converts local timestamps to UTC on paste, and tracks investigation time with a built-in countdown timer.
 
 ## Features
 
@@ -73,6 +73,30 @@ Insert the current UTC date or datetime with a token or command.
 
 Tokens are replaced automatically as you type, or use the commands **Insert current date** / **Insert current datetime**.
 
+### Local Time → UTC Conversion
+
+On paste, automatically converts local timestamps to UTC and keeps the original time in brackets.
+
+**Input** (pasted from Sophos Central or similar tools):
+```
+May 27, 2026 12:17 PM    Central management has been resumed
+May 27, 2026 11:57 AM    'WipeGuard' exploit prevented
+May 27, 2026 04:15:43 PM    Show computer tamper protection password
+```
+
+**Output** (UTC+8 configured):
+```
+2026-05-27 04:17 UTC (May 27, 2026 12:17 PM UTC+8)    Central management has been resumed
+2026-05-27 03:57 UTC (May 27, 2026 11:57 AM UTC+8)    'WipeGuard' exploit prevented
+2026-05-27 08:15 UTC (May 27, 2026 04:15:43 PM UTC+8)    Show computer tamper protection password
+```
+
+- Handles both `HH:MM AM/PM` and `HH:MM:SS AM/PM` formats (seconds are dropped in the UTC output)
+- Supports any UTC offset: `+8`, `-5`, `+5:30` for half-hour zones like IST
+- Scope markers let you limit conversion to a specific region of your note (same pattern as defang scope)
+- A notice confirms when timestamps are converted
+- Manual command available: **Convert local timestamps to UTC (selection or whole note)**
+
 ### Paste as Plain Text
 Strips all rich-text formatting when pasting. Useful when copying from browsers, PDFs, or other tools. Toggle on/off in settings.
 
@@ -104,6 +128,9 @@ Open **Settings → CyberScribe** to configure:
 | Color rules | Add/remove regex → color pairs (up to 12) |
 | Auto-defang → Scope | Optional start/end regex to limit defang region |
 | Auto-defang → IOC types | Per-type regex and enable/disable toggle |
+| Local time → UTC → Enable | Convert local timestamps to UTC on paste |
+| Local time → UTC → Local timezone | UTC offset of the source timestamps (e.g. `+8`, `-5`, `+5:30`) |
+| Local time → UTC → Scope | Optional start/end regex to limit conversion to a region |
 
 ## Use Case
 
